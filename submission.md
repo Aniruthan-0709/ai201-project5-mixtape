@@ -9,7 +9,7 @@
 - `routes/users.py`: Endpoints for viewing a user profile, checking a user's streak, listing notifications, and marking a notification read.
 - `routes/feed.py`: Endpoints for "friends listening now" and the general activity feed.
 - `services/streak_service.py`: Owns listening-streak logic. `record_listening_event()` logs a `ListeningEvent` and updates the user's streak in the same transaction. `update_listening_streak()` contains the day-comparison rules that decide whether the streak increments, resets, or stays the same.
-- `services/feed_service.py`: Builds the two friend-facing feeds. `get_friends_listening_now()` filters `ListeningEvent` rows to the last 24 hours and de-duplicates to one (most recent) entry per friend. `get_activity_feed()` skips the time filter entirely and just returns the most recent N events.
+- `services/feed_service.py`: Builds the two friend-facing feeds. `get_friends_listening_now()` filters `ListeningEvent` rows to a recency window and de-duplicates to one (most recent) entry per friend. `get_activity_feed()` skips the time filter entirely and just returns the most recent N events.
 - `services/search_service.py`: Case-insensitive search over song title/artist, plus a single-song lookup.
 - `services/notification_service.py`: The largest service — owns notification creation/reads AND two write operations that have a notification as a side effect: `rate_song()` (upserts a `Rating`) and `add_to_playlist()` (appends a song to a playlist and notifies the original sharer).
 - `services/playlist_service.py`: Playlist creation and retrieval — `get_playlist_songs()` joins `Song` to `playlist_entries` ordered by `position`.
@@ -68,23 +68,43 @@ except the one testing this exact bug, so no other streak behavior is affected.
 
 ---
 
-## Bug Reproductions (not yet fixed)
-
 ### Issue #2 — Friends Listening Now shows people from yesterday
 
-**How I reproduced it:** Wrote a script creating two friended users. Friend B's
-`ListeningEvent.listened_at` was set to 23 hours before "now," landing on the previous
-calendar day (now = 2026-07-05, event = 2026-07-04). Called
-`get_friends_listening_now()` for friend A — friend B still appeared in the results
-(`Bob shown as 'listening now'? True`), even though the event happened "yesterday" by
-calendar date.
+**How I reproduced it:** Wrote a script with two friended users. Set friend B's
+`listened_at` to a fixed timestamp late the previous calendar day (11:30 PM, July
+4th). Calling `get_friends_listening_now()` for friend A showed B as "listening now"
+(`True`), even though the event happened on a different calendar date.
 
-**Root cause candidate:** the function filters on a rolling 24-hour window
-(`cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD`), not a calendar-day
-boundary. Any event within the last 24 hours qualifies as "now," regardless of whether
-it falls on today's or yesterday's date. Early in the day, this window reaches back
-into the previous calendar day, so a friend who listened late yesterday still shows up
-as currently listening.
+**How I found the root cause:** Started in `feed_service.py`'s
+`get_friends_listening_now()`, since that's the function the route calls directly.
+Read the `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD` line and confirmed
+via a synthetic test that a 30-hour-old event was correctly excluded — ruling out a
+simple "filter doesn't work" theory. Realized the filter uses a rolling 24-hour window,
+not a calendar-day boundary, and confirmed this by testing an event 23 hours old that
+landed on the previous calendar date but still passed the filter.
+
+**The root cause:** `RECENT_THRESHOLD = timedelta(hours=24)` defined "recent" as
+"within the last 24 hours," not "since midnight today." Early in the day, subtracting
+24 hours from `now` produces a cutoff that falls on the *previous* calendar day, so any
+event from late "yesterday" still satisfied `listened_at >= cutoff`. The bug wasn't
+that the filter was broken — it correctly enforced a 24-hour window — it's that a
+rolling window doesn't match the feature's intended meaning of "today."
+
+**My fix and side-effect check:** Changed the cutoff calculation from
+`now - RECENT_THRESHOLD` to `now.replace(hour=0, minute=0, second=0, microsecond=0)`,
+making "recent" mean "since midnight UTC today." Removed the now-unused
+`RECENT_THRESHOLD` constant and the unused `timedelta` import. Verified on both sides
+of the boundary: an event at 11:30 PM the previous day is now correctly excluded
+(`False`), and an event at 12:30 AM today is correctly included (`True`). Ran the full
+test suite (`pytest tests/ -v`) — `test_streaks.py` (5/5) and `test_search.py` (5/5)
+still pass, confirming this change didn't affect unrelated features. Two
+`test_playlists.py` failures appeared, but these are a separate, pre-existing bug
+(Issue #5 — `get_playlist_songs` drops the last song via a `[:-1]` slice), unrelated
+to this fix.
+
+---
+
+## Bug Reproductions (not yet fixed)
 
 ### Issue #4 — Notified when added to playlist but not when rated
 
