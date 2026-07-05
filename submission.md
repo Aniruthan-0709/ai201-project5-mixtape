@@ -21,7 +21,7 @@
 2. `routes/songs.py`'s `rate()` handler validates that `user_id` and `score` are present, then calls `notification_service.rate_song(user_id, song_id, score)`.
 3. Inside `rate_song()`: validates `score` is 1–5, looks up the `Song` and `User` (raises `ValueError` → 404 if either is missing), then checks for an existing `Rating` with that `(user_id, song_id)` pair (there's a `UniqueConstraint` on that pair in `models.py`, so this table can only ever have one rating per user per song). If one exists, it updates the score; otherwise it creates a new `Rating` row.
 4. Commits and returns the `Rating`, which the route serializes via `.to_dict()` back to the client as JSON.
-5. Notably, `rate_song()` never calls `create_notification()` — unlike the sibling function `add_to_playlist()` in the same file, which does notify the song's original sharer after adding a song to a playlist. This asymmetry is the likely root cause behind Issue #4 ("notified when added to playlist but not when rated").
+5. Notably, `rate_song()` never calls `create_notification()` — unlike the sibling function `add_to_playlist()` in the same file, which does notify the song's original sharer after adding a song to a playlist. This asymmetry is the root cause behind Issue #4 ("notified when added to playlist but not when rated").
 
 ## Patterns I Noticed
 
@@ -31,23 +31,44 @@
 
 ---
 
-## Bug Reproductions
+## Root Cause Analysis & Fixes
 
-### Issue #1 — Listening streak keeps resetting
+### Issue #1 — My listening streak keeps resetting
 
-**How I reproduced it:** Ran the existing test suite: `pytest tests/test_streaks.py -v`.
-`test_streak_increments_on_sunday` fails — a user who listens on Saturday (streak=1)
-and again the next day, Sunday, ends up with `listening_streak == 1` instead of the
-expected `2`. Assertion error: `assert 1 == 2`. All 4 other streak tests pass, isolating
-the bug to the Sunday-specific branch in `update_listening_streak()`.
+**How I reproduced it:** Ran `pytest tests/test_streaks.py -v` before making any changes.
+`test_streak_increments_on_sunday` failed: a user who listens on Saturday (streak=1)
+and again the next day, Sunday, ended up with `listening_streak == 1` instead of the
+expected `2` (`assert 1 == 2`). All 4 other streak tests passed, isolating the failure
+to the Sunday-specific case.
 
-**Root cause candidate:** the increment condition is
-`days_since_last == 1 and today.weekday() != 6`. On Sundays (`weekday() == 6`), this
-condition is `False` even when the user listened on the immediately preceding day, so
-execution falls through to the `else` branch and the streak resets to 1 instead of
-incrementing. Nothing in the function's docstring mentions Sundays as a special case —
-the documented rules only describe "no prior listen," "same day," "consecutive day,"
-and "skipped a day."
+**How I found the root cause:** Started in `streak_service.py`, in
+`update_listening_streak()`, since that's the function the failing test calls directly.
+Compared the function's docstring (which only describes four cases: no prior listen,
+same-day, consecutive-day, skipped-day) against its actual code, and noticed the
+`elif` condition included `and today.weekday() != 6` — a clause never mentioned in the
+docstring. That mismatch between documented behavior and actual code was the signal
+that this was the bug, not just a suspicious area.
+
+**The root cause:** Python's `date.weekday()` returns `6` for Sunday. The increment
+branch was written as `elif days_since_last == 1 and today.weekday() != 6`, combining
+a valid same-day-gap check with an unrelated weekday check using `and`. On Sundays,
+`today.weekday() != 6` evaluates to `False`, so the whole `elif` condition is `False`
+even when `days_since_last == 1` is `True` — meaning the user genuinely listened on
+consecutive days. Execution falls through to the `else` branch, which was intended to
+handle skipped days, and the streak gets reset to 1 instead of incremented, purely
+because the day happened to be a Sunday.
+
+**My fix and side-effect check:** Removed the `and today.weekday() != 6` clause,
+changing the condition to `elif days_since_last == 1:`. This makes the code match
+exactly what the docstring documents — no weekday exception. Verified by rerunning
+`pytest tests/test_streaks.py -v`: all 5 tests pass, including the previously-failing
+Sunday test. Checked the other 4 tests (same-day, consecutive-day, skipped-day, new
+user) to confirm none relied on the removed clause — none of them use Sunday dates
+except the one testing this exact bug, so no other streak behavior is affected.
+
+---
+
+## Bug Reproductions (not yet fixed)
 
 ### Issue #2 — Friends Listening Now shows people from yesterday
 
