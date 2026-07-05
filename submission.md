@@ -28,3 +28,52 @@
 - **Routes are thin, services hold logic.** Every route handler's job is limited to: parse the request, call one service function, format the response and map exceptions (`ValueError` → 400/404). No route file contains business logic itself.
 - **Services are organized by side effect, not by data type.** There's no standalone `rating_service.py` even though `Rating` is its own model — rating logic lives in `notification_service.py` because rating a song is conceptually "an action that might need to notify someone." The same is true for `add_to_playlist()`, which lives there instead of in `playlist_service.py`.
 - **Shared `db` instance pattern.** Every model and service imports the same `db` object from `app.py` rather than each module creating its own — this is what lets a single `record_listening_event()` call commit both a `ListeningEvent` insert and a `User` streak update atomically.
+
+---
+
+## Bug Reproductions
+
+### Issue #1 — Listening streak keeps resetting
+
+**How I reproduced it:** Ran the existing test suite: `pytest tests/test_streaks.py -v`.
+`test_streak_increments_on_sunday` fails — a user who listens on Saturday (streak=1)
+and again the next day, Sunday, ends up with `listening_streak == 1` instead of the
+expected `2`. Assertion error: `assert 1 == 2`. All 4 other streak tests pass, isolating
+the bug to the Sunday-specific branch in `update_listening_streak()`.
+
+**Root cause candidate:** the increment condition is
+`days_since_last == 1 and today.weekday() != 6`. On Sundays (`weekday() == 6`), this
+condition is `False` even when the user listened on the immediately preceding day, so
+execution falls through to the `else` branch and the streak resets to 1 instead of
+incrementing. Nothing in the function's docstring mentions Sundays as a special case —
+the documented rules only describe "no prior listen," "same day," "consecutive day,"
+and "skipped a day."
+
+### Issue #2 — Friends Listening Now shows people from yesterday
+
+**How I reproduced it:** Wrote a script creating two friended users. Friend B's
+`ListeningEvent.listened_at` was set to 23 hours before "now," landing on the previous
+calendar day (now = 2026-07-05, event = 2026-07-04). Called
+`get_friends_listening_now()` for friend A — friend B still appeared in the results
+(`Bob shown as 'listening now'? True`), even though the event happened "yesterday" by
+calendar date.
+
+**Root cause candidate:** the function filters on a rolling 24-hour window
+(`cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD`), not a calendar-day
+boundary. Any event within the last 24 hours qualifies as "now," regardless of whether
+it falls on today's or yesterday's date. Early in the day, this window reaches back
+into the previous calendar day, so a friend who listened late yesterday still shows up
+as currently listening.
+
+### Issue #4 — Notified when added to playlist but not when rated
+
+**How I reproduced it:** Wrote a script where a "rater" user calls `rate_song()` on a
+song shared by a "sharer" user. Checked `get_notifications(sharer.id)` afterward — the
+result was an empty list (`Count: 0`).
+
+**Root cause candidate:** `rate_song()` looks up the `Song` and `User`, validates the
+score, upserts the `Rating`, commits, and returns — it never references
+`song.shared_by` and never calls `create_notification()`. This is inconsistent with the
+sibling function `add_to_playlist()` in the same file, which explicitly reads
+`song.shared_by` and calls `create_notification()` after adding a song to a playlist.
+The rating path is simply missing the equivalent notification call.
